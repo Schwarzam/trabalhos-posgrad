@@ -11,6 +11,13 @@ from OpenGL.GLU import *
 
 import adss
 
+import os
+import json
+import time
+import gzip
+import hashlib
+from pathlib import Path
+
 
 # ============================================================
 # CONFIG
@@ -20,7 +27,7 @@ USERNAME = ""
 PASSWORD = ""
 
 QUERY = """
-select top 80000
+select 
     g.source_id,
     g.ra,
     g.dec,
@@ -34,20 +41,24 @@ select top 80000
 from public.gaia_dr3 as g
 join public.geodist_gaia_dr3 as d
     on g.source_id = d.source_id
-where g.phot_g_mean_mag < 15.8
-  and d.r_med_geo is not null
-  and d.r_med_geo < 500
+where d.r_med_geo < 40
 """
 
-SCREEN_W = 1600
-SCREEN_H = 950
+CACHE_DIR = Path("./cache_gaia")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+USE_CACHE = True
+FORCE_REFRESH = False
+
+SCREEN_W = 1200
+SCREEN_H = 720
 
 FOVY = 60.0
 NEAR = 0.02
 FAR = 10000.0
 
 # Bigger visual scale so movement feels more obvious
-DISTANCE_SCALE = 0.01
+DISTANCE_SCALE = 1
 
 # Stars
 POINT_SIZE_BASE = 3.5
@@ -59,15 +70,15 @@ LOAD_RADIUS_CHUNKS = 4
 
 # Camera feel
 MOUSE_SENSITIVITY = 0.12
-ACCEL = 0.045
+ACCEL = 0.0045
 FRICTION = 0.88
-MAX_SPEED = 0.22
+MAX_SPEED = 0.01
 
 # Picking
 PICK_RADIUS_PX = 18
 
 # Earth
-EARTH_RADIUS = 0.13
+EARTH_RADIUS = 0.01
 
 # Background
 N_BG_STARS = 3500
@@ -85,7 +96,6 @@ BUTTON_H = 36
 MINIMAP_SIZE = 220
 MINIMAP_PADDING = 16
 MINIMAP_RANGE = 12.0
-
 
 # ============================================================
 # HELPERS
@@ -188,21 +198,40 @@ class ChunkKey:
 
 class StarCatalog:
     def __init__(self, df):
-        self.source_id = df["source_id"].to_numpy(np.int64)
-        self.ra = df["ra"].to_numpy(np.float64)
-        self.dec = df["dec"].to_numpy(np.float64)
-        self.phot_g = df["phot_g_mean_mag"].to_numpy(np.float64)
-        self.bp_rp = df["bp_rp"].to_numpy(np.float64)
-        self.r_med_geo = df["r_med_geo"].to_numpy(np.float64)
-        self.r_lo_geo = df["r_lo_geo"].to_numpy(np.float64)
-        self.r_hi_geo = df["r_hi_geo"].to_numpy(np.float64)
-        self.r_med_photogeo = df["r_med_photogeo"].to_numpy(np.float64)
-        self.flag = df["flag"].astype(str).to_numpy()
+        self.source_id = pd.to_numeric(df["source_id"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+
+        self.ra = pd.to_numeric(df["ra"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.dec = pd.to_numeric(df["dec"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.phot_g = pd.to_numeric(df["phot_g_mean_mag"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.bp_rp = pd.to_numeric(df["bp_rp"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.r_med_geo = pd.to_numeric(df["r_med_geo"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.r_lo_geo = pd.to_numeric(df["r_lo_geo"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.r_hi_geo = pd.to_numeric(df["r_hi_geo"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        self.r_med_photogeo = pd.to_numeric(df["r_med_photogeo"], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+
+        self.flag = df["flag"].astype("string").fillna("").to_numpy()
+
+        valid = (
+            np.isfinite(self.ra) &
+            np.isfinite(self.dec) &
+            np.isfinite(self.r_med_geo)
+        )
+
+        self.source_id = self.source_id[valid]
+        self.ra = self.ra[valid]
+        self.dec = self.dec[valid]
+        self.phot_g = self.phot_g[valid]
+        self.bp_rp = self.bp_rp[valid]
+        self.r_med_geo = self.r_med_geo[valid]
+        self.r_lo_geo = self.r_lo_geo[valid]
+        self.r_hi_geo = self.r_hi_geo[valid]
+        self.r_med_photogeo = self.r_med_photogeo[valid]
+        self.flag = self.flag[valid]
 
         x, y, z = spherical_to_cartesian(self.ra, self.dec, self.r_med_geo)
-        self.x = x * DISTANCE_SCALE
-        self.y = y * DISTANCE_SCALE
-        self.z = z * DISTANCE_SCALE
+        self.x = (x * DISTANCE_SCALE).astype(np.float32)
+        self.y = (y * DISTANCE_SCALE).astype(np.float32)
+        self.z = (z * DISTANCE_SCALE).astype(np.float32)
 
         colors = np.array([bp_rp_to_rgb_scalar(v) for v in self.bp_rp], dtype=np.float32)
         self.r = colors[:, 0]
@@ -211,8 +240,13 @@ class StarCatalog:
 
         self.size = np.array([mag_to_size_scalar(v) for v in self.phot_g], dtype=np.float32)
 
-        self.n = len(self.source_id)
+        self.positions = np.column_stack([self.x, self.y, self.z]).astype(np.float32)
+        self.colors = np.column_stack([self.r, self.g, self.b]).astype(np.float32)
 
+        # bucket point sizes so OpenGL can draw each bucket in one call
+        self.size_bucket = np.clip(np.round(self.size).astype(np.int32), 1, 32)
+
+        self.n = len(self.source_id)
         self.chunk_map = {}
         self._build_chunks()
 
@@ -251,12 +285,12 @@ class StarCatalog:
         return [
             f"source_id: {int(self.source_id[i])}",
             f"ra / dec: {self.ra[i]:.6f} / {self.dec[i]:.6f}",
-            f"G mag: {self.phot_g[i]:.3f}",
-            f"BP-RP: {self.bp_rp[i]:.3f}" if not np.isnan(self.bp_rp[i]) else "BP-RP: -",
-            f"r_med_geo: {self.r_med_geo[i]:.2f} pc",
-            f"r_lo_geo: {self.r_lo_geo[i]:.2f} pc" if not np.isnan(self.r_lo_geo[i]) else "r_lo_geo: -",
-            f"r_hi_geo: {self.r_hi_geo[i]:.2f} pc" if not np.isnan(self.r_hi_geo[i]) else "r_hi_geo: -",
-            f"r_med_photogeo: {self.r_med_photogeo[i]:.2f} pc" if not np.isnan(self.r_med_photogeo[i]) else "r_med_photogeo: -",
+            f"G mag: {self.phot_g[i]:.3f}" if np.isfinite(self.phot_g[i]) else "G mag: -",
+            f"BP-RP: {self.bp_rp[i]:.3f}" if np.isfinite(self.bp_rp[i]) else "BP-RP: -",
+            f"r_med_geo: {self.r_med_geo[i]:.2f} pc" if np.isfinite(self.r_med_geo[i]) else "r_med_geo: -",
+            f"r_lo_geo: {self.r_lo_geo[i]:.2f} pc" if np.isfinite(self.r_lo_geo[i]) else "r_lo_geo: -",
+            f"r_hi_geo: {self.r_hi_geo[i]:.2f} pc" if np.isfinite(self.r_hi_geo[i]) else "r_hi_geo: -",
+            f"r_med_photogeo: {self.r_med_photogeo[i]:.2f} pc" if np.isfinite(self.r_med_photogeo[i]) else "r_med_photogeo: -",
             f"flag: {self.flag[i]}",
         ]
 
@@ -264,7 +298,50 @@ class StarCatalog:
 # ============================================================
 # FETCH
 # ============================================================
+def query_cache_key():
+    payload = {
+        "base_url": BASE_URL,
+        "query": QUERY.strip(),
+    }
+    s = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(s).hexdigest()
+
+def query_cache_paths():
+    key = query_cache_key()
+    return {
+        "data": CACHE_DIR / f"{key}.pkl.gz",
+        "meta": CACHE_DIR / f"{key}.json",
+    }
+
+def load_cached_dataframe():
+    paths = query_cache_paths()
+    if not paths["data"].exists():
+        return None
+
+    print(f"Loading cached query: {paths['data']}")
+    return pd.read_pickle(paths["data"], compression="gzip")
+
+def save_cached_dataframe(df):
+    paths = query_cache_paths()
+    df.to_pickle(paths["data"], compression="gzip")
+
+    meta = {
+        "created_at_unix": time.time(),
+        "rows": int(len(df)),
+        "query": QUERY.strip(),
+        "base_url": BASE_URL,
+    }
+    with open(paths["meta"], "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"Saved cache: {paths['data']}")
+    
 def fetch_catalog():
+    if USE_CACHE and not FORCE_REFRESH:
+        df = load_cached_dataframe()
+        if df is not None and len(df) > 0:
+            return StarCatalog(df)
+
     cl = adss.ADSSClient(
         base_url=BASE_URL,
         username=USERNAME,
@@ -285,6 +362,17 @@ def fetch_catalog():
 
     if len(df) == 0:
         raise RuntimeError("Query returned no rows.")
+
+    num_cols = [
+        "source_id", "ra", "dec", "phot_g_mean_mag", "bp_rp",
+        "r_med_geo", "r_lo_geo", "r_hi_geo", "r_med_photogeo"
+    ]
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if USE_CACHE:
+        save_cached_dataframe(df)
 
     return StarCatalog(df)
 
@@ -385,43 +473,45 @@ def setup_opengl():
 # ============================================================
 def make_background_stars(n=N_BG_STARS, radius=BG_RADIUS, seed=42):
     rng = np.random.default_rng(seed)
-    pts = []
-    cols = []
-    sizes = []
 
-    for _ in range(n):
-        u = rng.uniform(-1, 1)
-        phi = rng.uniform(0, 2 * np.pi)
-        s = math.sqrt(max(0.0, 1 - u * u))
+    u = rng.uniform(-1, 1, n)
+    phi = rng.uniform(0, 2 * np.pi, n)
+    s = np.sqrt(np.maximum(0.0, 1 - u * u))
 
-        x = radius * s * math.cos(phi)
-        y = radius * u
-        z = radius * s * math.sin(phi)
+    x = radius * s * np.cos(phi)
+    y = radius * u
+    z = radius * s * np.sin(phi)
 
-        pts.append((x, y, z))
-        b = rng.uniform(0.55, 1.0)
-        cols.append((b, b, b))
-        sizes.append(rng.uniform(1.0, 2.0))
+    pts = np.column_stack([x, y, z]).astype(np.float32)
 
-    return np.array(pts), np.array(cols), np.array(sizes)
+    b = rng.uniform(0.55, 1.0, n).astype(np.float32)
+    cols = np.column_stack([b, b, b]).astype(np.float32)
+
+    sizes = np.clip(np.round(rng.uniform(1.0, 2.5, n)).astype(np.int32), 1, 4)
+
+    return pts, cols, sizes
 
 
 def draw_background(bg_pts, bg_cols, bg_sizes, cam_pos):
     glPushMatrix()
     glTranslatef(cam_pos[0], cam_pos[1], cam_pos[2])
 
-    unique_sizes = np.unique(np.round(bg_sizes, 1))
-    for s in unique_sizes:
-        mask = np.isclose(bg_sizes, s, atol=0.05)
-        pts = bg_pts[mask]
-        cols = bg_cols[mask]
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_COLOR_ARRAY)
 
-        glPointSize(float(s))
-        glBegin(GL_POINTS)
-        for (x, y, z), (r, g, b) in zip(pts, cols):
-            glColor3f(r, g, b)
-            glVertex3f(x, y, z)
-        glEnd()
+    try:
+        for s in np.unique(bg_sizes):
+            mask = (bg_sizes == s)
+            pts = bg_pts[mask]
+            cols = bg_cols[mask]
+
+            glPointSize(float(s))
+            glVertexPointer(3, GL_FLOAT, 0, pts)
+            glColorPointer(3, GL_FLOAT, 0, cols)
+            glDrawArrays(GL_POINTS, 0, len(pts))
+    finally:
+        glDisableClientState(GL_COLOR_ARRAY)
+        glDisableClientState(GL_VERTEX_ARRAY)
 
     glPopMatrix()
 
@@ -479,19 +569,33 @@ def draw_star_points(cat, idx):
     if len(idx) == 0:
         return
 
-    sizes = cat.size[idx]
-    unique_sizes = np.unique(np.round(sizes, 1))
+    pos = cat.positions[idx]
+    col = cat.colors[idx]
+    size_buckets = cat.size_bucket[idx]
 
-    for s in unique_sizes:
-        mask = np.isclose(sizes, s, atol=0.05)
-        sel = idx[mask]
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_COLOR_ARRAY)
 
-        glPointSize(float(s))
-        glBegin(GL_POINTS)
-        for i in sel:
-            glColor3f(cat.r[i], cat.g[i], cat.b[i])
-            glVertex3f(cat.x[i], cat.y[i], cat.z[i])
-        glEnd()
+    try:
+        glVertexPointer(3, GL_FLOAT, 0, pos)
+        glColorPointer(3, GL_FLOAT, 0, col)
+
+        for s in np.unique(size_buckets):
+            mask = (size_buckets == s)
+            count = int(mask.sum())
+            if count == 0:
+                continue
+
+            glPointSize(float(s))
+            sub_pos = pos[mask]
+            sub_col = col[mask]
+
+            glVertexPointer(3, GL_FLOAT, 0, sub_pos)
+            glColorPointer(3, GL_FLOAT, 0, sub_col)
+            glDrawArrays(GL_POINTS, 0, len(sub_pos))
+    finally:
+        glDisableClientState(GL_COLOR_ARRAY)
+        glDisableClientState(GL_VERTEX_ARRAY)
 
 
 def draw_selected_star_as_sphere(cat, i):
@@ -594,7 +698,6 @@ def draw_minimap(camera, cat, visible_idx):
     glVertex2f(mx, my + size)
     glEnd()
 
-    # earth
     ex, ey = world_to_minimap(camera.pos, 0.0, 0.0, mx, my, size, MINIMAP_RANGE)
     glColor3f(0.2, 0.7, 1.0)
     glPointSize(7.0)
@@ -602,23 +705,26 @@ def draw_minimap(camera, cat, visible_idx):
     glVertex2f(ex, ey)
     glEnd()
 
-    # stars
+    if len(visible_idx) > 1500:
+        step = max(1, len(visible_idx) // 1500)
+        mini_idx = visible_idx[::step]
+    else:
+        mini_idx = visible_idx
+
     glPointSize(2.0)
     glBegin(GL_POINTS)
-    for i in visible_idx:
+    for i in mini_idx:
         px, py = world_to_minimap(camera.pos, cat.x[i], cat.z[i], mx, my, size, MINIMAP_RANGE)
         glColor3f(cat.r[i], cat.g[i], cat.b[i])
         glVertex2f(px, py)
     glEnd()
 
-    # camera
     glColor3f(1.0, 0.85, 0.1)
     glPointSize(8.0)
     glBegin(GL_POINTS)
     glVertex2f(mx + size / 2, my + size / 2)
     glEnd()
 
-    # heading
     f = camera.forward()
     glColor3f(1.0, 0.85, 0.1)
     glBegin(GL_LINES)
@@ -727,6 +833,20 @@ def main():
     pygame.display.set_mode((SCREEN_W, SCREEN_H), DOUBLEBUF | OPENGL)
     pygame.display.set_caption("Gaia 3D Explorer")
 
+    print("OpenGL vendor:", glGetString(GL_VENDOR).decode())
+    print("OpenGL renderer:", glGetString(GL_RENDERER).decode())
+    print("OpenGL version:", glGetString(GL_VERSION).decode())
+
+    paths = query_cache_paths()
+    if paths["meta"].exists():
+        try:
+            with open(paths["meta"], "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            print(f"Cache rows: {meta.get('rows')}")
+            print(f"Cache created: {time.ctime(meta.get('created_at_unix', 0))}")
+        except Exception as e:
+            print(f"Warning: could not read cache metadata: {e}")
+
     font = pygame.font.SysFont("Consolas", 18)
     clock = pygame.time.Clock()
 
@@ -736,6 +856,8 @@ def main():
     camera = Camera()
 
     ui_mode = False
+    show_hud = True
+
     pygame.event.set_grab(True)
     pygame.mouse.set_visible(False)
 
@@ -761,6 +883,9 @@ def main():
                     ui_mode = not ui_mode
                     pygame.event.set_grab(not ui_mode)
                     pygame.mouse.set_visible(ui_mode)
+
+                elif event.key == pygame.K_h:
+                    show_hud = not show_hud
 
             elif event.type == pygame.MOUSEMOTION and not ui_mode:
                 mx, my = event.rel
@@ -803,7 +928,8 @@ def main():
             draw_selected_star_as_sphere(cat, selected_i)
             draw_selected_marker(cat, selected_i)
 
-        draw_hud(font, camera, cat, visible_idx, selected_i, ui_mode, fps)
+        if show_hud:
+            draw_hud(font, camera, cat, visible_idx, selected_i, ui_mode, fps)
 
         pygame.display.flip()
 
@@ -811,9 +937,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}")
-        pygame.quit()
-        sys.exit(1)
+    main()

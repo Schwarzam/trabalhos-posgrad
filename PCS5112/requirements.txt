@@ -1,0 +1,6 @@
+numpy
+pandas
+pygame
+PyOpenGL
+PyOpenGL_accelerate
+adss
